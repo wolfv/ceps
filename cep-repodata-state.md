@@ -1,7 +1,8 @@
 <table>
-<tr><td> Title </td><td> .state.json files for repodata metadata </td>
+<tr><td> Title </td><td> .info.json files for repodata metadata </td>
 <tr><td> Status </td><td> Draft </td></tr>
 <tr><td> Author(s) </td><td> Wolf Vollprecht &lt;wolf@prefix.dev&gt;</td></tr>
+<tr><td> </td><td> Daniel Holth &lt;dholth@anaconda.com&gt;</td></tr>
 <tr><td> Created </td><td> Jan 09, 2023</td></tr>
 <tr><td> Updated </td><td> Jan 09, 2023</td></tr>
 <tr><td> Discussion </td><td> https://conda.slack.com/archives/C017F7C0VM3/p1672669131100819 </td></tr>
@@ -25,7 +26,7 @@ These are stored as three string values.
 
 This is not an ideal approach as it modifies the `repodata.json` file and corrupts e.g. the hash of the file. Also, the repodata files have gotten increasingly large, and parsing these state values can require parsing a large `json` file.
 
-Therefore we propose to store the metadata in a secondary file called `.state.json` file next to the repodata.
+Therefore we propose to store the metadata in a secondary file called `<cache-key>.info.json` file next to the repodata.
 
 Another motivating factor is that for the `jlap` proposal we need to (repeatedly) compute the hash value of the `repodata.json` file -- that only gives correct results straight away when the repodata is stored externally.
 
@@ -35,18 +36,30 @@ Both mamba and conda currently use the same cache folder. If both don't implemen
 
 ```json5
 {
-    // we ensure that state.json and .json files are in sync by storing the file
-    // last modified time in the state file, as well as the file size
+    // we ensure that info.json and .json files are in sync by storing the file
+    // last modified time in the info file, as well as the file size
 
     // seconds and nanoseconds counted from UNIX timestamp (1970-01-01)
     "mtime_ns": INTEGER,
     "size": INTEGER, // file size in bytes
+
+    // most recent remote request e.g. "304 Not Modified", instead
+    // of touching the cached repodata.json file.
+    // compare with `cache_control: max-age=`.
+    // nanosecond-resolution UNIX timestamp.
+    "refresh_ns": INTEGER,
 
     // The header values as before
     "url": STRING,
     "etag": STRING,
     "mod": STRING,
     "cache_control": STRING,
+
+    // Hash of the cached-on-disk repodata.json. In Python: hashlib.blake2b(digest_size=32)
+    "blake2_256": STRING,
+    // Upstream hash represented by the on-disk file. Used for jlap which
+    // reformats the cached json but knows equivalent remote repodata.json hashes.
+    "blake2_256_nominal": STRING,
 
     // these are alternative encodings of the repodata.json that
     // can be used for faster downloading
@@ -65,15 +78,45 @@ Both mamba and conda currently use the same cache folder. If both don't implemen
         // same format as `has_zst`
     },
 
-    "jlap": { } // unspecified additional state for jlap when available
+    "jlap": {
+        // Intermediate checksum leading the second-to-last line of repodata.jlap
+        "iv": "9448c699e681ee71b4bd524f73a0b690c387df7e9f0ea2bb7ffa24af1c8c27ca",
+        // Offset of the start of the second-to-last line of repodata.jlap in bytes
+        "pos": 4226360,
+        // Last json line of repodata.jlap, before the trailing checksum
+        "footer": {
+            "url": "repodata.json",
+            "latest": "3384620e0f2bf70a418a56db98785dda530b503990e32b68afb11f27e0324d7
+    5"
+        }
+        // Other keys may appear e.g. for debugging
+    }
 }
 ```
 
-If the `state.json` file_mtime or file_size does not match the `.json` file actual `mtime`, the header values are discarded. However, the `has_zst` or `has_jlap` values are kept as they are independent from the repodata validity on disk.
+If the `info.json` `mtime_ns` or `size` do not match the `.json` file the
+header values are discarded. However, the `has_zst` or `has_jlap` values are kept as
+they are independent from the repodata validity on disk.
 
 If the client is tracking `repodata.json.zst` or `repodata.jlap` instead of
-`(current_)?repodata.json`, then `etag`/`mod`/`cache_control` will correspond to
+`(current_)?repodata.json`, then `etag`/`last_modified`/`cache_control` will correspond to
 those remote files, instead of `repodata.json`.
+
+## Locking
+
+To ensure that the `info.json` is consistent with the cached `.json` even if
+multiple programs are trying to update the cache at the same time, locking
+should be used. The client uses the `info.json` file as a lock file. It holds an
+advisory `fcntl()` or Windows record lock on byte 21 of that file while updating
+both the `info.json` and `.json` files. It may or may not additionally lock the
+`.json` file. If the lock fails, neither file is changed.
+
+[A Python implementation](https://github.com/conda/conda/blob/main/conda/gateways/repodata/lock.py)
+[Mamba's LockFile class](https://github.com/mamba-org/mamba/blob/main/libmamba/include/mamba/core/util.hpp#L167)
+
+This minimal scheme only helps to prevent the cache from being corrupted.
+Additional locking would be neded to make it "advisable" to run multiple
+installers in parallel.
 
 ### Backward compatibility
 
