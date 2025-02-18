@@ -22,6 +22,19 @@ There are many downsides to the behavior of `conda-build`: it's very implicit, h
 
 For the v1 spec we are attempting to formalize the workings of the "top-level" build. For this, we introduce a new top-level key `cache`, that has the same values as a regular output.
 
+## Motivating Cases
+
+This section describes specific example cases which would be used by this workflow.
+
+### Dividing a single package variant into modular chunks
+
+Some packages have a monolithic build system but have optional components at runtime. The most common example of this case is splitting a package into development, runtime libraries, and runtime tools; the `dav1d-feedstock` is an example of this. `dav1d-dev` contains the developer artifacts: package config files and headers. `dav1d` contains the command line utility of the same name. `libdav1d7` contains the shared libraries that other packages link to dynamically at runtime. The artifacts in these packages cannot be built separately or doing so would result in redundant work, so the package is built all together, installed to the PREFIX, then split into the output packages.
+
+### Reusing cached build artifacts to build multiple variants
+
+I've heard that instead of building package from scratch for each python version, some maintainers try to rebuild multiple variants of a package from a cached working directory. This might be useful if upstream hasn't designed their build system to build C and Python APIs separately.
+
+
 ## Specification
 
 The top-level `cache` key looks as follows:
@@ -50,7 +63,7 @@ cache:
     script: build.sh
 ```
 
-<details> 
+<details>
   <summary>script build.sh default discussion</summary>
 We had some debate wether the cache output should _also_ default to `build.sh` or should not have any default value for the `script`. This is still undecided.
 </details>
@@ -104,5 +117,5 @@ Special care must be taken for `run-exports`. For example, the `${{ compiler('c'
 
 To ignore certain run exports, the usual `ignore_run_exports` specifiers can be used in each output.
 
-> [!NOTE]  
+> [!NOTE]
 > We have pondered other logic for attaching run exports. We could have a more complicated algorithm that attaches the run exports only to the lowest package in a chain of packages connected by `pin_subpackage(..., exact=True)`, however, duplicating the same dependencies should not really matter much to the solver.
