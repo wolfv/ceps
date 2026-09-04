@@ -5,8 +5,8 @@
 <tr><td> Status </td><td> Draft </td></tr>
 <tr><td> Author(s) </td><td> Wolf Vollprecht &lt;wolf@prefix.dev&gt;</td></tr>
 <tr><td> Created </td><td> Jul 24, 2026</td></tr>
-<tr><td> Updated </td><td> Jul 27, 2026</td></tr>
-<tr><td> Discussion </td><td> NA </td></tr>
+<tr><td> Updated </td><td> Sep 4, 2026</td></tr>
+<tr><td> Discussion </td><td> https://github.com/conda/ceps/pull/183 </td></tr>
 <tr><td> Implementation </td><td> https://github.com/conda/rattler (feat/ios-android-subdirs) </td></tr>
 </table>
 
@@ -52,9 +52,12 @@ single-architecture and follows the `<os>-<arch>` syntax.
 | Subdir            | Architecture | Android ABI   |
 | ----------------- | ------------ | ------------- |
 | `android-aarch64` | `aarch64`    | `arm64-v8a`   |
-| `android-armv7a`  | `armv7a`     | `armeabi-v7a` |
+| `android-armv7l`  | `armv7l`     | `armeabi-v7a` |
 | `android-64`      | `x86_64`     | `x86_64`      |
 | `android-32`      | `x86`        | `x86`         |
+
+Build tools and channels MAY choose not to produce packages for the 32-bit subdirs. CPython does not
+officially support the 32-bit Android ABIs ([PEP 738]), but native libraries for them remain in use.
 
 ### Virtual packages
 
@@ -97,6 +100,13 @@ The `__unix` virtual package MUST be present for every subdir defined by this CE
   vendor ABIs. The conda token identifies the operating system, so `ios` follows CPython's platform
   name and includes iPads. The `simulator` suffix records the ABI split without implying an
   iPhone-only target.
+- **Architecture tokens follow existing subdirs, not vendor ABI names.** The `<arch>` token reuses
+  the tokens conda already uses for the same architecture on other platforms: `arm64` as in
+  `osx-arm64`, `aarch64` and `armv7l` as in `linux-aarch64` and `linux-armv7l`, and `64` and `32` as
+  in `linux-64` and `linux-32`. Android's own ABI names (`arm64-v8a`, `armeabi-v7a`) are not used
+  because they would introduce tokens that are unknown to existing tooling and would violate CEP 26. A future 64-bit ARM ABI variant on Android
+  is expected to be tied to a minimum Android version, which `__android` can express without a new
+  subdir.
 - **Version in a virtual package.** Encoding the minimum OS version in the subdir, as PyPI does in a
   wheel tag, would multiply the number of subdirs and move compatibility resolution out of the
   solver. `__ios` and `__android` reuse conda's existing version-compatibility mechanism.
@@ -106,9 +116,14 @@ The `__unix` virtual package MUST be present for every subdir defined by this CE
 - **`ios-simulator-*` subdirs.** A second dash does not conform to CEP 26. The simulator variant is
   therefore folded into the OS token.
 - **An `ios-64` subdir.** Apple does not provide an x86_64 iOS device ABI.
-- **Using `armv7l` for Android.** Android's `armeabi-v7a` uses the softfp calling convention and
-  Bionic, unlike the ABI represented by `linux-armv7l`. The `armv7a` token keeps these incompatible
-  targets distinct.
+- **An `armv7a` token for 32-bit ARM Android.** Android's `armeabi-v7a` differs from the ABI of
+  `linux-armv7l` in calling convention and C library, but the architecture is still ARMv7
+  little-endian, and the OS token already keeps the two apart. The existing `armv7l` token is reused.
+- **Target-triple subdirs.** Naming subdirs after target triples, such as `x86_64-linux-android`
+  with `linux-64` as an alias for `x86_64-linux-gnu`, would distinguish Android from glibc Linux
+  without a new OS token. CEP 26 already fixes the `<os>-<arch>` syntax, and build scripts that
+  match `linux-*` need to be updated for Android either way, just as Python code checking
+  `sys.platform == "linux"` does.
 - **Using `linux-*` for Android.** Modeling Bionic as a C standard-library variant in `linux-*` would
   put incompatible binaries in the same subdir and rely on every package declaring an exact standard
   library constraint. Android also has its own userspace ABI, dynamic linker, and platform APIs, so
