@@ -5,7 +5,7 @@
 <tr><td> Status </td><td> Draft </td></tr>
 <tr><td> Author(s) </td><td> Wolf Vollprecht &lt;wolf@prefix.dev&gt;</td></tr>
 <tr><td> Created </td><td> Dec 02, 2025</td></tr>
-<tr><td> Updated </td><td> Jul 23, 2026</td></tr>
+<tr><td> Updated </td><td> Sep 04, 2026</td></tr>
 <tr><td> Discussion </td><td> https://github.com/conda/ceps/pull/142 </td></tr>
 <tr><td> Implementation </td><td> https://prefix.dev (preview implementation) </td></tr>
 <tr><td> Requires </td><td> CEP 27 (Publish Attestation) </td></tr>
@@ -73,6 +73,8 @@ The second URL is content-addressed. Here, `<sha256>` is the 64-character lowerc
 
 To append attestations, a channel first publishes the new content-addressed sidecar, then updates the mutable `.sigs` URL, and finally updates repodata. Thus conda clients with either old or new repodata can fetch the corresponding immutable sidecar without a cache race.
 
+How a channel collects, serializes, or merges additions before publishing a new sidecar (for example, an upload API, or sidecar fragments discovered by an indexer next to the package files) is left to the channel implementation. Whatever the mechanism, every attestation the channel has accepted for a package MUST appear in the next sidecar it publishes for that package; concurrent additions MUST NOT be lost.
+
 Whether a package has attestations is advertised in the repodata index. Conda clients discover sidecars through repodata and use the content-addressed URL; generic Sigstore tooling may use the mutable `.sigs` URL. Packages without attestations need not have either sidecar URL.
 
 #### Example
@@ -85,6 +87,10 @@ Whether a package has attestations is advertised in the repodata index. Conda cl
 ### Response Format
 
 The sidecar MUST contain a JSON array of one or more [Sigstore bundles][Sigstore Bundle]. Each bundle represents one attestation for the package.
+
+The array is append-only and ordered by acceptance: when a channel publishes a new sidecar revision, the existing elements MUST be preserved byte-for-byte and in the same order, and newly accepted bundles MUST be appended after them.
+A channel that has no record of acceptance order (for example, a static channel re-indexed from scratch) MAY instead sort the elements by the SHA256 hash of their bytes, and MUST then apply that order consistently for all revisions of that package's sidecar.
+Bundle-internal properties such as transparency log indexes or timestamps are not comparable across Sigstore instances and log versions, and MUST NOT be used as the sort key. Clients MUST NOT attach meaning to the position of a bundle in the array.
 
 Channels MUST serve both URLs byte-for-byte identical to the current sidecar whose SHA256 hash is published in repodata (see [Repodata changes](#repodata-changes)). Channels MUST NOT re-serialize the JSON when serving it. The content-addressed URL is safe to host on static infrastructure (e.g. object storage or CDNs) and safe to cache and mirror by content hash.
 
@@ -113,7 +119,7 @@ Each element in the array MUST be a valid [Sigstore Bundle] as defined by the Si
 
 Conda-client discovery goes through repodata, so clients MUST NOT infer anything about the existence of the package itself from a sidecar response. In particular, channels that do not implement this CEP may return `404 Not Found` for every sidecar URL, even when the underlying package exists.
 
-For a package whose repodata record carries an `attestations_sha256` field, any failure to retrieve a sidecar matching the advertised hash — including a `404 Not Found` — is a retrieval failure (see [Client Requirements](#client-requirements)).
+For a package whose repodata record carries an `attestations_sha256` field, any failure to retrieve a sidecar matching the advertised hash, including a `404 Not Found`, is a retrieval failure (see [Client Requirements](#client-requirements)).
 
 ### Repodata changes
 
@@ -172,7 +178,7 @@ A conda client that consumes attestation sidecars:
 2. MUST reject an invalid `attestations_sha256` value before constructing the content-addressed URL.
 3. MUST enforce an implementation-defined maximum size while streaming the sidecar and verify its hash before parsing it.
 4. MUST treat an unavailable, oversized, malformed, or hash-mismatched advertised sidecar as a retrieval failure. The client MUST NOT use the sidecar or silently treat the package as having no attestations; the user-facing response is tool policy.
-5. MUST follow [CEP 27] and the subject-binding rules in [Attestation Requirements](#attestation-requirements) when verifying a publish attestation.
+5. MUST follow [CEP 27] when verifying a publish attestation, including its subject-binding rules (see [Attestation Requirements](#attestation-requirements)).
 
 ## Security Considerations
 
