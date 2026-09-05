@@ -89,8 +89,8 @@ The override MUST be ignored for other target subdirs.
 
 > The Android API level can be obtained via:
 >
-> * Python's `sys.getandroidapilevel()` or `platform.android_ver().api_level` ([PEP 738])
-> * `getprop ro.build.version.sdk`
+> - Python's `sys.getandroidapilevel()` or `platform.android_ver().api_level` ([PEP 738])
+> - `getprop ro.build.version.sdk`
 
 #### Fallback version
 
