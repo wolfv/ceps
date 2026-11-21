@@ -345,8 +345,8 @@ verification the recipe asks for. Build tools that validate recipes against the 
 already reject unknown keys.
 
 rattler-build implemented an experimental precursor from version 0.65.0 to 0.80.2, under the key
-`attestation` (singular, one mapping) and behind its `--experimental` flag. Build tools MAY accept that key in rendered recipes, so that packages built
-with those versions can still be rebuilt with verification. Recipes MUST use `attestations`.
+`attestation` (singular, one mapping) and behind its `--experimental` flag. Recipes MUST use
+`attestations`.
 
 ## Open questions
 
