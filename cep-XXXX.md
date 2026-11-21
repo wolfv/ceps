@@ -1,545 +1,393 @@
-# CEP XXXX - Source Attestation Verification in Recipes
+# CEP XXXX - Verifying Sigstore attestations of recipe sources
 
 <table>
-<tr><td> Title </td><td> Source Attestation Verification in Recipes </td></tr>
+<tr><td> Title </td><td> Verifying Sigstore attestations of recipe sources </td></tr>
 <tr><td> Status </td><td> Draft </td></tr>
-<tr><td> Author(s) </td><td> Wolf Vollprecht &lt;wolf@prefix.dev&gt;</td></tr>
-<tr><td> Created </td><td> May 20, 2026</td></tr>
-<tr><td> Updated </td><td> Jul 6, 2026</td></tr>
+<tr><td> Author(s) </td><td> Wolf Vollprecht &lt;wolf@prefix.dev&gt; </td></tr>
+<tr><td> Created </td><td> May 20, 2026 </td></tr>
+<tr><td> Updated </td><td> Nov 21, 2026 </td></tr>
 <tr><td> Discussion </td><td> https://github.com/conda/ceps/pull/168 </td></tr>
-<tr><td> Implementation </td><td> https://github.com/prefix-dev/rattler-build (experimental) </td></tr>
+<tr><td> Implementation </td><td> <a href="https://github.com/prefix-dev/rattler-build/pull/2947">prefix-dev/rattler-build#2947</a> </td></tr>
+<tr><td> Requires </td><td> CEP 13, CEP 14 (recipe format) </td></tr>
 </table>
 
 > The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT",
   "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as
   described in [RFC2119][RFC2119] when, and only when, they appear in all capitals, as shown here.
+>
 
 ## Abstract
 
-This CEP extends the conda recipe format ([CEP 14]) with an optional
-`attestation` field on URL sources. The field lets recipe authors declare
-that an upstream source archive carries a [Sigstore] attestation, and
-specifies a minimum set of checks that any conformant builder MUST perform
-before using the archive. It further specifies how the verified bundles
-are embedded in the built package, so the package itself stays tied to
-its upstream producer. The CEP standardizes the recipe schema and this
-embedding only: the attestation formats and predicate semantics
-themselves remain owned by their upstream issuers (e.g.
-[PyPI][PyPI Integrity], GitHub Releases).
+This CEP adds an `attestations` key to URL sources in the recipe format of [CEP 13] and [CEP 14].
+It names the [Sigstore] attestations that a downloaded source archive must carry, and the
+publishers that must have signed them. A build tool verifies those attestations before it uses the
+source, and fails the build if verification fails.
+
+The attestations are those that upstream projects already publish: PyPI provenance ([PEP 740]),
+GitHub release attestations and build provenance, and any other Sigstore bundle. [CEP 27] and
+[CEP 50] cover attestations of the conda packages a build *produces*. This CEP covers the sources a
+build *consumes*, so that a package can carry a verified chain from the upstream repository to the
+conda artifact.
 
 ## Motivation
 
-Recipes routinely download source tarballs from third-party hosts (PyPI,
-GitHub Releases, project mirrors). Today the only integrity signal in the
-recipe is a content hash — `sha256:` or `md5:` — which proves that the
-bytes did not change since the recipe was last updated, but says nothing
-about *who* produced them.
+A recipe pins a source by its checksum:
 
-Several upstream ecosystems now publish [Sigstore] attestations alongside
-their release artifacts:
+```yaml
+source:
+  url: https://files.pythonhosted.org/packages/source/f/flask/flask-3.1.1.tar.gz
+  sha256: 6489f1...
+```
 
-- PyPI exposes [PEP 740][PEP 740] provenance through its [Integrity API][PyPI Integrity].
-- GitHub releases can attach `.sigstore.json` bundles via [`actions/attest`][actions-attest].
-- Other ecosystems (Rust crates, npm) are following similar patterns.
+The checksum proves that the archive is the one the recipe author downloaded. It does not prove
+that this archive came from the upstream project. Recipe authors and automated update bots (for
+example conda-forge's autotick bot) compute the checksum from whatever the URL returns at the
+moment of the update. If an attacker has replaced the archive by then, the attacker's archive is
+pinned. Such a replacement can come from:
 
-A recipe author who wants to bind their build to a specific upstream
-publisher (e.g. "this Flask tarball must have been produced by the
-`pallets/flask` GitHub Actions workflow") currently has no portable way
-to express that intent. Tools that verify attestations do so with
-out-of-band configuration that does not travel with the recipe.
+- a compromised maintainer account on the package index,
+- a mirror or CDN that serves modified content, or
+- a release asset that someone with write access to the repository swapped out.
 
-This CEP closes that gap by:
+Upstream ecosystems now sign their releases with Sigstore:
 
-1. Defining an `attestation` block on URL sources so the intent is
-   recorded in the recipe itself, alongside `sha256` and `url`.
-2. Defining a *minimum* set of checks that a conformant builder MUST
-   perform when the block is present, so a verified build means the same
-   thing across implementations.
-3. Defining how verified bundles are embedded in the built package, so
-   the provenance link survives into the distributed artifact and can be
-   re-verified offline.
-4. Explicitly **not** redefining upstream predicate formats. PyPI's
-   provenance schema, GitHub's bundle format, and the [in-toto] statement
-   format are referenced as-is.
+- PyPI publishes [PEP 740] attestations for every file uploaded through Trusted Publishing, served
+  through its [integrity API][PyPI Integrity].
+- GitHub signs a release attestation for every [immutable release][GitHub immutable releases],
+  covering the SHA-256 of each uploaded asset, and projects add SLSA build provenance with
+  `actions/attest-build-provenance`.
+- GitLab CI, npm and RubyGems publish similar provenance.
+
+These attestations bind an archive to the repository, workflow and ref that produced it, and every
+signature is recorded in a public transparency log. A recipe can state which publisher it expects.
+The build tool can then refuse an archive that this publisher did not sign, even when the checksum
+in the recipe was updated to match it.
 
 ## Specification
 
-### Recipe Schema
+### The `attestations` key
 
-A URL source ([CEP 14], `source:` mapping with `url:`) MAY include an
-`attestation` mapping:
+A URL source (CEP 14, "URL source") MAY contain an `attestations` key. Its value is either one
+*attestation entry* or a non-empty list of them. A single mapping is equivalent to a list with one
+element.
 
 ```yaml
 source:
-  url: https://files.pythonhosted.org/packages/.../flask-3.1.1.tar.gz
-  sha256: "6489f1..."
-  attestation:
+  url: https://files.pythonhosted.org/packages/source/f/flask/flask-${{ version }}.tar.gz
+  sha256: 284c7b8f2f58cb737f0cf1c30fd7eaf0ccfcde196099d24ecede3fc2005aa59e
+  attestations:
     publishers:
-      - github:pallets/flask
-    bundle_url: https://example.com/flask-3.1.1.tar.gz.sigstore.json  # optional
-    predicate_type: https://docs.pypi.org/attestations/publish/v1     # optional
+      - github:pallets(16748505)/flask(596892)@refs/tags/${{ version }}
 ```
 
-The `attestation` mapping has the following fields:
+An empty list MUST be rejected as an error, so that an edit cannot turn verification off while
+appearing to keep it. Other source types (`git`, `path`) do not take `attestations`; see
+[Future work](#future-work).
 
-| Field            | Type                          | Required | Description                                                                                   |
-| ---------------- | ----------------------------- | -------- | --------------------------------------------------------------------------------------------- |
-| `publishers`     | list of publisher identities  | yes      | Publisher identities that the attestations' signing certificates must match. See below.       |
-| `bundle_url`     | string or list of strings     | no       | Explicit URL(s) of Sigstore bundles or provenance responses. See **Bundle Discovery** below.  |
-| `predicate_type` | string (type URI)             | no       | Restricts which attestations count towards publisher matching. See **Minimum Verification**.  |
+An attestation entry is a mapping with these keys:
 
-The `attestation` field MUST NOT appear on `git:` or `path:` sources in
-this CEP. (Future CEPs MAY extend it to other source types.)
+| Key | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `bundle_url` | URL | no | Where to download the Sigstore bundle. When omitted, the build tool derives it ([Bundle discovery](#bundle-discovery)). |
+| `publishers` | non-empty list of publishers | no | Publishers that must match the verified attestation. Every listed publisher MUST match. An empty list MUST be rejected as an error. |
 
-When `attestation` is present, the source MUST also declare a `sha256`
-hash: the in-toto subject formats used in practice identify artifacts by
-SHA-256, and a weaker hash such as `md5` next to an attestation would
-undermine the binding.
+Both keys MAY be templated with the Jinja syntax of CEP 13. An entry with neither key is an error.
 
-A recipe MAY omit the `attestation` field; absence means the builder
-SHALL NOT perform any source attestation verification for that source.
-The field is an additive, backwards-compatible extension of the
-[CEP 14] recipe schema and does not change the schema version.
+Every entry is verified on its own, and every entry MUST verify. A recipe can therefore require
+several independent kinds of evidence for one archive: for example, that a GitHub release asset is
+covered by the immutable release attestation **and** by the build provenance of the release
+workflow.
 
-### Publisher Identities
+`attestations` does not replace the checksum. A recipe that uses `attestations` SHOULD still give
+`sha256`. The checksum keeps the build reproducible, and the attestation shows that the pinned
+bytes came from the expected publisher.
 
-Sigstore binds a signature to the pair of an X.509 certificate *identity*
-(the Subject Alternative Name, SAN) and the *OIDC issuer* that vouched
-for it. A publisher identity in this CEP therefore always denotes such a
-pair. This mirrors established verification interfaces such as `cosign
-verify --certificate-identity/--certificate-oidc-issuer` and
-`gh attestation verify`, which accept the same two values.
+### Publishers
 
-Each entry in `publishers` is either an **explicit mapping** or a
-**shorthand string**.
+A publisher names a source-code repository on a forge that issues Sigstore identities. This CEP
+defines the forges `github` (GitHub Actions and GitHub releases) and `gitlab` (GitLab CI on
+gitlab.com). A publisher has a string form and a mapping form.
 
-#### Explicit mapping form
+The string form is:
+
+```text
+<forge>:<owner>[(<owner_id>)]/<repository>[(<repository_id>)][@<ref>]
+```
+
+- `owner` and `repository` are matched case-insensitively.
+- `owner_id` and `repository_id` are the forge's immutable numeric IDs of the owner (user,
+  organization or group) and of the repository. Each is optional.
+- `ref` is a full git ref such as `refs/tags/3.1.1` or `refs/heads/main`. It is optional.
+
+The mapping form takes exactly one of `github` or `gitlab`, whose value is `owner/repository`
+without IDs, and these optional keys: `ref`, `owner_id`, `repository_id` and `environment`.
+`environment` is the deployment environment the signing workflow ran in (for example `release`).
 
 ```yaml
 publishers:
-  - identity: https://github.com/pallets/flask
-    issuer: https://token.actions.githubusercontent.com
+  - github: pallets/flask
+    ref: refs/tags/${{ version }}
+    owner_id: 16748505
+    repository_id: 596892
+    environment: release
 ```
 
-| Field      | Required | Description                                                        |
-| ---------- | -------- | ------------------------------------------------------------------ |
-| `identity` | yes      | The certificate SAN to match. Matching rules are described below.  |
-| `issuer`   | yes      | The OIDC issuer URL of the certificate.                            |
+A publisher matches an attestation only if the repository and every value that the publisher pins
+are present in the verified attestation and equal to it. A pinned value that the attestation does
+not record does not match.
 
-An `identity` value that is a URL (starts with `https://`) is matched
-against URI SANs using **repository-boundary prefix matching** (see
-below); this comparison is case-insensitive, since the providers defined
-here treat owner and repository names as case-insensitive while the SAN
-carries whatever casing the provider canonicalized. Any other `identity`
-value is matched for exact, case-sensitive string equality against the
-certificate's SAN (e.g. an email SAN). The `issuer` is always compared
-for exact, case-sensitive string equality with the certificate's issuer
-extension.
+Recipe authors SHOULD pin `owner_id` and `repository_id`. A repository name can be reused: when an
+account or repository is renamed or deleted, someone else can register the same name. The numeric
+IDs are never reused.
 
-The mapping form can express identities that are not `owner/repo` URLs —
-for example artifacts signed via Google Cloud infrastructure carry email
-SANs such as `123456789-compute@developer.gserviceaccount.com` with the
-issuer `https://accounts.google.com` — as well as self-hosted CI
-instances (e.g. a GitHub Enterprise Server or self-managed GitLab
-deployment) whose issuer differs from the hosted defaults.
+### Bundle discovery
 
-#### Shorthand string form
+The build tool MUST locate the bundle for each entry in this order:
 
-A shorthand publisher identity is a string of the form:
+1. If `bundle_url` is given, download it.
+2. If the source URL is a PyPI file (host `files.pythonhosted.org`, or host `pypi.org` or
+   `pypi.io` with a path starting with `/packages/`), request the PyPI integrity API at
+   `https://pypi.org/integrity/{project}/{version}/{filename}/provenance` and use its
+   `attestation_bundles`. `{filename}` is the last path segment of the URL the file was finally
+   downloaded from, after redirects. `{project}` and `{version}` are parsed from `{filename}`
+   according to the PyPA [source distribution][sdist format] and [wheel][wheel format] file name
+   specifications (for an sdist, the name and version are separated by the last `-` before the
+   archive extension). `pypi.io` is a legacy alias of `pypi.org` that many existing recipes use.
+3. If the source URL is a GitHub release asset
+   (`https://github.com/{owner}/{repo}/releases/download/{tag}/{asset}`), query
+   `https://api.github.com/repos/{owner}/{repo}/attestations/sha256:{digest}?predicate_type=release`,
+   where `{digest}` is the SHA-256 of the downloaded file.
+4. Otherwise, fail with an error asking for `bundle_url`.
 
-```text
-<provider>:<owner>/<repo>[@<ref>]
-```
+The bundle MAY be a Sigstore bundle with a DSSE envelope containing an [in-toto] statement, or a
+bundle with a plain message signature (as produced by `cosign sign-blob --bundle`). A response
+that holds several bundles (a PyPI provenance object, or a GitHub attestations API listing)
+verifies if at least one of its bundles verifies and matches all publishers of the entry.
 
-| Component  | Meaning                                                                                |
-| ---------- | -------------------------------------------------------------------------------------- |
-| `provider` | The identity provider. This CEP defines `github` and `gitlab`. Others MAY be added.    |
-| `owner`    | The owner / organization on that provider. MUST NOT be empty.                          |
-| `repo`     | The repository on that provider. MUST NOT be empty.                                    |
-| `ref`      | Optional ref constraint (e.g. `refs/tags/v1.0`). Reserved; see **Future Work** below.  |
+The build tool MUST distinguish "no attestation exists" (for example HTTP 404 from the API) from
+network errors, rate limits and server errors in its error messages. Both MUST fail the build.
 
-A shorthand is parsed by splitting at the first `:` (provider), the
-first subsequent `/` (owner), and the first `@` (ref), if any. The
-`<repo>` component MAY therefore itself contain `/` separators to
-address nested namespaces — e.g. GitLab subgroups:
-`gitlab:group/subgroup/project` expands to the identity
-`https://gitlab.com/group/subgroup/project`.
+A build tool MAY send credentials to the GitHub API (for example from `GITHUB_TOKEN`) to avoid its
+rate limit. It MUST NOT send them to any other host.
 
-The `ref` semantics are not defined by this CEP. Builders that do not
-implement ref matching MUST fail with an error when a `ref` is present,
-rather than silently ignoring the constraint.
+### Verification
 
-Each shorthand is exactly equivalent to an explicit mapping:
+For each attestation entry, the build tool MUST perform all of the following against the
+downloaded file. If any step fails, the build MUST fail.
 
-| Provider | Expands to `identity`                    | Expands to `issuer`                                  |
-| -------- | ---------------------------------------- | ---------------------------------------------------- |
-| `github` | `https://github.com/<owner>/<repo>`      | `https://token.actions.githubusercontent.com`        |
-| `gitlab` | `https://gitlab.com/<owner>/<repo>`      | `https://gitlab.com`                                 |
+1. **Trust root.** Load the Sigstore trust root through [TUF]: the Sigstore public-good root for
+   workflow-signed attestations, or GitHub's root for GitHub release attestations.
+2. **Certificate.** Verify the signing certificate chain against the trust root at a verified
+   signing time.
+3. **Signing time.** Verify the signing time through an inclusion proof in the transparency log,
+   or for GitHub release attestations through an RFC 3161 timestamp from GitHub's timestamp
+   authority.
+4. **Signature.** Verify the signature over the DSSE payload or the message.
+5. **Subject.** Verify that the SHA-256 digest of the downloaded file is a subject of the signed
+   in-toto statement, or, for a message signature, that the signed digest equals it.
+6. **Publishers.** Verify that every listed publisher matches, as described below.
 
-The providers named here refer to the hosted `github.com` and
-`gitlab.com` services only. Self-hosted instances of these products use
-different issuer URLs and MUST be expressed with the explicit mapping
-form instead.
+If `publishers` is omitted, steps 1–5 still apply, any signer is accepted, and the build tool
+SHOULD print a warning. An empty `publishers` list is an error (see above), so that an edit cannot
+drop the identity check while appearing to keep it.
 
-Builders that encounter an unknown `provider` MUST fail with an error
-rather than silently skipping verification.
+#### Workflow-signed attestations
 
-> **Why not PURLs?** [Package-URLs][PURL] identify *package artifacts*
-> within an ecosystem, not *signing identities*: they cannot carry the
-> OIDC issuer, and non-repository identities (such as email SANs) have
-> no PURL form. The `(identity, issuer)` pair is the native vocabulary
-> of Sigstore certificate verification, so this CEP uses it directly.
+This applies to PyPI provenance, build provenance and other bundles signed by a CI workflow.
 
-#### Repository-boundary prefix matching
+- The certificate's OIDC issuer MUST be `https://token.actions.githubusercontent.com` for `github`
+  and `https://gitlab.com` for `gitlab`.
+- The certificate's Subject Alternative Name (SAN) identifies the workflow, for example
+  `https://github.com/pallets/flask/.github/workflows/publish.yml@refs/tags/3.1.1`. The repository
+  is the path that follows the forge's host.
+- The ref is the part that follows the **first** `@` after the repository path. Git ref names may
+  contain `@`. Splitting at the last `@` would let a branch named `x@refs/tags/3.1.1` pass as the
+  tag `3.1.1`.
+- `owner_id` is compared with the Fulcio *Source Repository Owner Identifier* extension
+  (OID `1.3.6.1.4.1.57264.1.17`) and `repository_id` with the *Source Repository Identifier*
+  extension (OID `1.3.6.1.4.1.57264.1.15`).
+- These extensions describe the repository that *triggered* the workflow, while the SAN names the
+  repository that *contains* the workflow. The two differ when a project signs through a reusable
+  workflow from another repository. The build tool MUST check that the *Source Repository URI*
+  extension (OID `1.3.6.1.4.1.57264.1.12`) names the same repository as the SAN, and fail
+  otherwise, so that the repository, the IDs and the ref of a publisher are always taken from the
+  same repository. See [open question 2](#open-questions).
+- Fulcio certificates do not record the deployment environment of the workflow run.
+  `environment` can therefore only be checked against the `publisher` object of a PyPI provenance
+  response, which PyPI fills from the OIDC token it verified at upload. This value is asserted by
+  PyPI and is not covered by the Sigstore signature. For any bundle not discovered through the
+  PyPI integrity API, a publisher that pins `environment` never matches.
 
-Sigstore certificates for CI providers typically encode the full workflow
-path as the SAN (for example
-`https://github.com/pallets/flask/.github/workflows/release.yml@refs/tags/3.1.1`).
-Matching by raw string prefix is unsafe: `https://github.com/pallets/flask`
-would match `https://github.com/pallets/flask-cors` as well.
+The ref in a workflow certificate is the ref of the signing *workflow run*. A project that
+publishes from a `workflow_dispatch` run on `main` is signed with `refs/heads/main`, not with the
+release tag.
 
-A publisher's URL identity `P` matches a certificate SAN `S` if and
-only if:
+#### GitHub release attestations
 
-- `S == P`, or
-- `S` starts with `P` *and* the character immediately following `P` in
-  `S` is `/` or `@`.
+A GitHub release attestation is signed by GitHub's release service, not by a workflow.
 
-This rule MUST be applied by all conformant builders.
+- Its certificate identity MUST be exactly `https://dotcom.releases.github.com`.
+- The repository, `owner_id` and `repository_id` are taken from the signed in-toto statement of
+  the same bundle, whose subjects include `pkg:github/{owner}/{repo}@{tag}`.
+- A `ref` MUST be a tag ref (`refs/tags/{tag}`) and is compared with the release tag.
+- A release attestation records no deployment environment, so a publisher that pins `environment`
+  never matches one.
 
-### Bundle Discovery
+GitHub's generated "Source code" archives (`/archive/...`) are not covered by a release
+attestation: the attestation records the commit, not the bytes of the generated archive.
+Projects that want their source to be verifiable SHOULD upload a source archive as a release
+asset.
 
-[CEP 14] allows `url:` to be a list of equivalent mirror URLs; the
-*download URL* below refers to the entry from which the builder
-actually retrieved the archive.
+### Mirrors
 
-The bundle URLs are determined as follows, in order:
+When a URL source lists several URLs, the build tool derives the bundle for the URL it actually
+downloaded from. If no bundle can be derived for that URL and no `bundle_url` is given,
+verification fails. Since the digest is what is verified, a `bundle_url` works for every mirror.
 
-1. If `bundle_url` is set in the recipe, the builder MUST fetch every
-   listed URL (a plain string is equivalent to a single-element list).
-2. Otherwise, if the download URL's host is `pypi.org`, `pypi.io`, or
-   `files.pythonhosted.org`, the builder MUST construct a PyPI
-   Integrity API URL of the form:
+### Recording the verification
 
-   ```text
-   https://pypi.org/integrity/<project>/<version>/<filename>/provenance
-   ```
+A build tool SHOULD record the verified attestations in the recipe metadata it stores in the
+package (rattler-build uses `info/recipe/rendered_recipe.yaml`), including, for each publisher, the `owner_id` and
+`repository_id` found in the attestation even when the recipe did not pin them. A consumer can then
+see which repository vouched for the source of a package.
 
-   where `<filename>` is the last path segment of the download URL, and
-   `<project>` and `<version>` are derived from it: after stripping the
-   file extension, an sdist stem is split at its last `-` (sdist
-   filenames follow [PEP 625][PEP 625]), while for a wheel the first
-   two `-`-separated fields of the stem are the project and version
-   (per the [binary distribution format][Wheel Format]). The project
-   part is then [PEP 503][PEP 503]-normalized (lowercase, runs of
-   `[-_.]` collapsed to `-`). `pypi.io` is a legacy alias of `pypi.org`
-   that remains widespread in conda recipes.
+### Caching
 
-   Legacy sdist filenames that predate PEP 625 can parse ambiguously;
-   if the derived URL is wrong, the Integrity API fetch fails (and with
-   it the build), and the recipe author SHOULD set an explicit
-   `bundle_url` instead.
-3. Otherwise, the builder MUST fail with an error reporting that no
-   `bundle_url` is set and one cannot be auto-derived.
-
-This list is closed for this CEP: builders MUST NOT auto-derive bundle
-URLs for other hosts, so that a recipe verifies identically on every
-conformant builder. Future CEPs MAY extend the auto-derivation list
-(e.g. for GitHub or GitLab releases); until then, recipe authors MUST
-provide an explicit `bundle_url` for non-PyPI hosts.
-
-Allowing `bundle_url` to be a list accommodates sources that publish
-attestations in more than one place (for example PyPI provenance *and* a
-GitHub release bundle); the bundles from all responses are pooled for
-verification.
-
-### Response Formats
-
-A builder MUST accept at least the following two response formats from
-each bundle URL:
-
-1. A [Sigstore Bundle][Sigstore Bundle] in JSON form, identified by the
-   presence of a `mediaType` field.
-2. A [PEP 740][PEP 740] provenance response with an `attestation_bundles`
-   array, each containing `attestations` that the builder converts to
-   Sigstore bundles.
-
-The bundles obtained from all fetched URLs together form the *bundle
-set* used in **Minimum Verification** below.
-
-For bundles converted from PEP 740 responses the builder SHOULD skip
-transparency-log verification, since PEP 740 does not preserve
-canonicalized Rekor entries; all other verification steps proceed
-normally.
-
-### Minimum Verification
-
-When the `attestation` field is present, the builder MUST, before using
-the downloaded source:
-
-1. **Download** the source archive and verify its `sha256` as it would
-   for any URL source.
-2. **Fetch** the attestation bundle set from the URLs determined in
-   **Bundle Discovery**. If any fetch fails — including a response
-   indicating that no attestations are available — the build MUST fail.
-3. **Verify** each bundle cryptographically as defined by the
-   [Sigstore Client Specification][Sigstore Client Spec]: certificate
-   chain validation against the trust root, transparency-log inclusion
-   (subject to the PEP 740 exception in **Response Formats**), and
-   timestamp verification. The trust root SHOULD be fetched via [TUF]
-   from the Sigstore public-good instance; cached trust material MAY be
-   used subject to the freshness rules of the Sigstore specification.
-   A bundle that fails cryptographic verification indicates tampering:
-   the build MUST fail.
-4. **Filter** the bundle set to those bundles whose in-toto statement
-   lists a `subject[].digest.sha256` equal to the SHA-256 of the
-   downloaded archive. Bundles attesting other artifacts — which can
-   legitimately occur in pooled responses — are excluded without error.
-   If the filtered set is empty, the build MUST fail.
-5. **Filter** the bundle set further, if `predicate_type` is set in the
-   recipe, to those bundles whose in-toto statement has exactly that
-   `predicateType`. If the filtered set is empty, the build MUST fail.
-6. **Verify** that for *each* publisher listed in `publishers`, at least
-   one bundle in the filtered bundle set has a certificate whose SAN
-   matches that publisher's `identity` (see **Publisher Identities**),
-   and whose OIDC issuer matches the publisher's `issuer`. If any
-   listed publisher cannot be matched, the build MUST fail.
-
-If any of the above checks fail, the builder MUST abort the build and
-MUST NOT use the downloaded source for further build steps.
-
-### Predicate Semantics Are Out of Scope
-
-This CEP does not define, restrict, or interpret the predicate types
-that appear in the in-toto statement. In particular:
-
-- A PyPI provenance response carries [PEP 740][PEP 740] predicates whose
-  semantics are owned by PyPI.
-- A GitHub-attested release archive may carry any predicate the
-  attester chose (commonly the SLSA build provenance predicate).
-- Conda-specific publish attestations are defined by [CEP 27] and apply
-  to *built conda packages*, not source archives.
-
-The optional `predicate_type` field does not change this: it pins the
-predicate *type string* without interpreting the predicate body, so that
-a signature with different semantics from the same identity (e.g. a test
-attestation instead of a publish attestation) does not satisfy the
-recipe's intent. Recipe authors SHOULD set it when the upstream predicate
-type is known and stable.
-
-A builder MAY apply additional predicate-specific checks beyond the
-minimum above; such checks are out of scope here.
-
-### Embedding verified bundles in the built package
-
-Builders that embed the rendered recipe in the built package (e.g.
-under `info/recipe/`, as rattler-build does with
-`info/recipe/rendered_recipe.yaml`) SHOULD also embed the attestation
-bundles they verified. The built package then carries the evidence that
-ties it back to its upstream source and producer: auditors and
-rebuilders can re-run the checks against the package alone, without
-re-fetching the bundle URLs — which may have moved or disappeared by
-then. Combined with a [CEP 27] publish attestation covering the built
-package itself, this yields a machine-checkable chain from the package
-through the recipe to the upstream source publisher.
-
-A builder that embeds bundles MUST use the following layout. Every
-bundle that survived the filtering steps of **Minimum Verification** is
-written, as a [Sigstore Bundle][Sigstore Bundle] in JSON form, to:
-
-```text
-info/recipe/attestations/<filename>.<n>.sigstore.json
-```
-
-where `<filename>` is the source archive's filename and `<n>` is the
-zero-based index of the bundle within that source's filtered bundle
-set. Bundles obtained from PEP 740 responses are stored in their
-*converted* Sigstore Bundle form. Bundles that were excluded during
-filtering MUST NOT be stored. Builders SHOULD serialize each stored
-bundle deterministically — byte-for-byte as fetched where possible,
-otherwise with stable key ordering — so that repeated builds produce
-identical packages.
-
-In the rendered recipe, the source's `attestation` mapping is augmented
-with a `verified` list containing one entry per stored bundle:
-
-```yaml
-source:
-  url: https://files.pythonhosted.org/packages/ab/cd/flask-3.1.1.tar.gz
-  sha256: "6489f1..."
-  attestation:
-    publishers:
-      - github:pallets/flask
-    verified:
-      - path: attestations/flask-3.1.1.tar.gz.0.sigstore.json
-        sha256: "9f31ab..."
-        predicate_type: https://docs.pypi.org/attestations/publish/v1
-        san: https://github.com/pallets/flask/.github/workflows/publish.yml@refs/tags/3.1.1
-        issuer: https://token.actions.githubusercontent.com
-```
-
-| Field            | Description                                                        |
-| ---------------- | ------------------------------------------------------------------ |
-| `path`           | Bundle file path, relative to the rendered recipe's directory.     |
-| `sha256`         | SHA-256 of the stored bundle file.                                 |
-| `predicate_type` | The `predicateType` of the bundle's in-toto statement.             |
-| `san`            | The certificate SAN, copied verbatim.                              |
-| `issuer`         | The certificate's OIDC issuer, copied verbatim.                    |
-
-The `verified` entries deliberately record no wall-clock timestamp:
-embedding one would make otherwise identical builds non-reproducible,
-and the transparency-log entries inside the stored bundles already
-carry signed time evidence.
-
-A consumer of the built package MAY re-run steps 3–6 of **Minimum
-Verification** against the stored bundles (using its own trust root) to
-independently confirm the publisher claims recorded in the rendered
-recipe. The `verified` metadata is a convenience index; the stored
-bundles remain the source of truth.
+A build tool that caches downloaded sources MUST NOT skip verification because a cached copy
+exists. It MUST verify again whenever the `attestations` configuration of the source changes. It
+MAY cache the result of a successful verification for an unchanged configuration and an unchanged
+file digest.
 
 ## Examples
 
-### PyPI source with auto-derived bundle URL
+A PyPI source, pinned to the release tag and to immutable IDs:
 
 ```yaml
 source:
-  url: https://files.pythonhosted.org/packages/ab/cd/flask-3.1.1.tar.gz
-  sha256: "6489f1..."
-  attestation:
+  url: https://files.pythonhosted.org/packages/source/f/flask/flask-${{ version }}.tar.gz
+  sha256: 284c7b8f2f58cb737f0cf1c30fd7eaf0ccfcde196099d24ecede3fc2005aa59e
+  attestations:
     publishers:
-      - github:pallets/flask
+      - github:pallets(16748505)/flask(596892)@refs/tags/${{ version }}
 ```
 
-The builder derives
-`https://pypi.org/integrity/flask/3.1.1/flask-3.1.1.tar.gz/provenance`,
-fetches the PEP 740 response, and verifies that one of the embedded
-attestations was signed by a workflow under `github.com/pallets/flask`.
-
-### GitHub release with explicit bundle
+A GitHub release asset that must be both part of the immutable release and built by the release
+workflow:
 
 ```yaml
 source:
-  url: https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
-  sha256: "eb33e5..."
-  attestation:
-    bundle_url: https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz.sigstore.json
-    publishers:
-      - github:facebook/zstd
+  url: https://github.com/astral-sh/uv/releases/download/${{ version }}/source.tar.gz
+  sha256: ${{ sha256 }}
+  attestations:
+    # The immutable release attestation, discovered automatically
+    - publishers:
+        - github:astral-sh(115962839)/uv(699532645)@refs/tags/${{ version }}
+    # The SLSA build provenance of the release workflow
+    - bundle_url: https://api.github.com/repos/astral-sh/uv/attestations/sha256:${{ sha256 }}?predicate_type=provenance
+      publishers:
+        - github:astral-sh(115962839)/uv(699532645)@refs/heads/main
 ```
 
-### Explicit identity mapping (email SAN, pinned predicate type)
+A bundle published next to the archive:
 
 ```yaml
 source:
-  url: https://files.pythonhosted.org/packages/ab/cd/widget-2.0.tar.gz
-  sha256: "abc123..."
-  attestation:
-    predicate_type: https://docs.pypi.org/attestations/publish/v1
+  url: https://example.org/releases/foo-${{ version }}.tar.gz
+  sha256: ...
+  attestations:
+    bundle_url: https://example.org/releases/foo-${{ version }}.tar.gz.sigstore.json
     publishers:
-      - identity: 123456789-compute@developer.gserviceaccount.com
-        issuer: https://accounts.google.com
+      - github: example/foo
+        ref: refs/tags/v${{ version }}
+        owner_id: 1234567
+        repository_id: 7654321
 ```
 
-### Multiple required publishers
+## Rationale
 
-```yaml
-source:
-  url: https://example.com/widget-2.0.tar.gz
-  sha256: "abc123..."
-  attestation:
-    bundle_url: https://example.com/widget-2.0.tar.gz.sigstore.json
-    publishers:
-      - github:widget-org/widget
-      - github:widget-org/release-bot
-```
+**Why verify in the build tool rather than in a bot?** An update bot that checks attestations
+protects only the updates it makes. Verifying at build time protects every build of the recipe:
+local builds, rebuilds of old recipes, and recipes edited by hand.
 
-Every listed publisher must be matched by some bundle in the bundle set.
+**Why exact identities instead of regular expressions?** Tools such as `cosign` accept identity
+regular expressions, and those are easy to get wrong (an unanchored `github.com/org/.*` also matches
+`github.com/org/repo-fork`). The structured publisher is parsed and compared field by field.
 
-## Security Considerations
+**Why a list of entries?** Different attestations prove different things. A release attestation
+proves that the file belongs to the immutable release at a tag. Build provenance proves which
+workflow and ref built it. A ref also means something different in each. Separate entries, each
+with its own publishers, keep these apart.
 
-### What attestation verification adds — and what it does not
+**Why fail closed?** `attestations` in a recipe states that unverified sources are not acceptable.
+If the build silently continued when the bundle could not be fetched, an attacker who can block
+that request could disable verification.
 
-A pinned `sha256` already guarantees that every build uses exactly the
-bytes the recipe author selected; an attacker who replaces the upstream
-archive *after* the recipe is written is caught by the hash check alone.
-The `attestation` block instead protects the *selection* of those bytes,
-and their auditability afterwards:
+## Security considerations
 
-- At authoring or update time, verification proves that the archive was
-  produced by the expected publisher — catching compromised uploads and
-  typosquatted or mirrored artifacts *before* their hash is pinned. This
-  matters most for automated version bumps, where no human inspects the
-  new tarball.
-- After the fact, the recipe records a machine-checkable claim about the
-  source's origin that auditors and rebuilders can re-verify.
+- **Name reuse:** pinning `owner_id` and `repository_id` protects against a renamed or deleted
+  repository whose name is registered again. Build tools SHOULD tell the user the IDs of a
+  successful verification, so that they can pin them.
+- **Ref parsing:** see the rule about the first `@` above.
+- **Publishers omitted:** an entry without publishers proves only that *someone* signed the file
+  with a Sigstore identity. That has little value, so build tools warn about it.
+- **Scope of the guarantee:** a valid attestation shows that the archive was produced by the named
+  repository's CI. It does not show that the repository's code is trustworthy, and it does not
+  protect against a compromised workflow in that repository. Pinning a tag `ref` (and, for PyPI
+  sources, `environment`) narrows what an attacker with push access can do.
+- **Availability:** verification needs network access to the bundle source and to the TUF
+  repository. Offline or air-gapped builds need the bundles and trust root mirrored.
 
-### The recipe itself is not signed
+## Backwards compatibility
 
-This CEP does not protect against modification of the recipe: an
-attacker who can edit the recipe can remove the `attestation` block (or
-change `publishers`) along with the hash. Defenses against recipe
-tampering — signed recipes or feedstocks, channel policies that
-*require* attestation blocks for certain sources, or lockfile-level
-pinning of verified provenance — are complementary and out of scope
-here.
+The `attestations` key is new. A build tool that does not implement this CEP SHOULD reject a recipe
+that uses it rather than ignore the key, because ignoring it would build the source without the
+verification the recipe asks for. Build tools that validate recipes against the recipe JSON schema
+already reject unknown keys.
 
-### Bundle transport
+rattler-build implemented an experimental precursor from version 0.65.0 to 0.80.2, under the key
+`attestation` (singular, one mapping) and behind its `--experimental` flag. Build tools MAY accept that key in rendered recipes, so that packages built
+with those versions can still be rebuilt with verification. Recipes MUST use `attestations`.
 
-Bundle URLs SHOULD use `https`. The security of verification does not
-depend on the transport, however: bundles are signed, so an attacker who
-controls the bundle host or the connection can at worst cause a build
-failure (denial of service), not a false verification success.
+## Open questions
 
-### Network dependence
+1. **Attestation types:** should verification require a specific predicate type for each
+   discovery path (the PyPI publish attestation for PyPI, SLSA provenance for build provenance),
+   or is any signed statement that names the digest acceptable, as now?
+2. **Reusable workflows:** the repository is matched against the workflow identity in the
+   certificate SAN. When a project signs through a reusable workflow from another repository, the
+   SAN names that other repository. Should the publisher be compared with the Fulcio
+   source-repository extensions instead, and the ref with the source-ref extension rather than with
+   the SAN? This would lift the requirement that both name the same repository.
+3. **GitHub release without publishers:** should a GitHub release asset without `publishers`
+   default to the repository in the download URL, rather than accepting any release attestation for
+   the digest?
+4. **More forges:** should this CEP define publisher prefixes for other OIDC issuers (Buildkite,
+   CircleCI, self-hosted GitHub and GitLab instances, Google Cloud service accounts whose identity
+   is an email address), or leave them to a later CEP?
+5. **GitLab subgroups:** GitLab projects can live in nested groups (`group/subgroup/project`).
+   Should the string form treat everything before the last `/` as the owner, or should GitLab
+   publishers use only the mapping form?
+6. **Environment:** `environment` can only be checked for PyPI, and only against a value asserted
+   by PyPI rather than signed. Is that enough to keep the key, or should it be removed?
+7. **Policy outside the recipe:** should channels (for example conda-forge) be able to require
+   attestations for sources from PyPI or GitHub releases, through a configuration of the build tool,
+   when the recipe does not ask for them?
 
-Verification requires fetching bundles and (via [TUF]) trust-root
-updates at build time. Builders MAY cache bundles and trust material
-alongside cached sources for offline or air-gapped operation, subject to
-the trust root freshness rules. Once a package is built, the embedded
-bundles (see **Embedding verified bundles in the built package**) allow
-re-verification without any upstream availability; *rebuilding* from the
-recipe, however, still depends on the bundle URLs remaining reachable —
-see **Future Work**.
+## Future work
 
-## Future Work
-
-- **Ref constraints.** The `@<ref>` suffix in the shorthand grammar is
-  reserved but its matching semantics are not yet defined (builders MUST
-  reject it for now, see **Publisher Identities**). A follow-up CEP may
-  define how `refs/tags/v1.0`, `refs/heads/main`, etc. are matched
-  against the certificate SAN.
-- **Additional auto-derivation hosts.** GitHub Releases, GitLab Releases,
-  and crates.io publish bundles at predictable locations; a follow-up
-  may standardize their derivation.
-- **Additional shorthand providers.** Follow-up CEPs may register more
-  shorthand providers (and their issuer URLs) as ecosystems adopt
-  Sigstore signing.
-- **Predicate-specific assertions.** Recipes may eventually want to
-  assert facts encoded in the predicate (e.g. SLSA build level,
-  reproducibility flags). That is deliberately not in this CEP.
-- **Bundle vendoring at build time.** Built packages embed their
-  verified bundles, but *rebuilding* an old recipe still requires its
-  bundle URLs (e.g. the PyPI Integrity API) to remain available. A
-  follow-up may standardize vendoring bundles next to the source recipe
-  or in channel metadata so that builds themselves remain possible
-  offline and long after upstream endpoints change.
-- **`git:` and `path:` sources.** Out of scope here; both have weaker
-  upstream conventions for attestation distribution today.
+- `git` sources: verify signed tags or commits (Sigstore `gitsign`, SSH or GPG signatures).
+- Linking the verified source attestation into the package's publish attestation ([CEP 27]), so
+  that a consumer can follow the chain from the conda package back to the upstream repository.
 
 ## References
 
-- [CEP 14 - Recipe format v1][CEP 14]
-- [CEP 27 - Publish attestation for conda packages][CEP 27]
-- [Sigstore][Sigstore]
-- [Sigstore Bundle Specification][Sigstore Bundle]
-- [Sigstore Client Specification][Sigstore Client Spec]
-- [in-toto Attestation Framework][in-toto]
-- [PEP 740 - Index support for digital attestations][PEP 740]
-- [PEP 625 - Filename of a source distribution][PEP 625]
-- [Binary distribution format (wheels)][Wheel Format]
-- [PyPI Integrity API][PyPI Integrity]
-- [Package-URL specification][PURL]
-- [`actions/attest`][actions-attest]
+- [Sigstore]
+- [Sigstore bundle format][Sigstore Bundle]
+- [in-toto]
+- [PEP 740]
+- [PyPI integrity API][PyPI Integrity]
+- [GitHub immutable releases][GitHub immutable releases]
+- [CEP 27] and [CEP 50]
 
 ## Copyright
 
@@ -548,15 +396,14 @@ All CEPs are explicitly [CC0 1.0 Universal](https://creativecommons.org/publicdo
 [RFC2119]: https://www.ietf.org/rfc/rfc2119.txt
 [Sigstore]: https://sigstore.dev
 [Sigstore Bundle]: https://github.com/sigstore/protobuf-specs/blob/main/protos/sigstore_bundle.proto
-[Sigstore Client Spec]: https://github.com/sigstore/architecture-docs/blob/main/client-spec.md
-[PEP 625]: https://peps.python.org/pep-0625/
-[Wheel Format]: https://packaging.python.org/en/latest/specifications/binary-distribution-format/
 [in-toto]: https://in-toto.io
+[TUF]: https://theupdateframework.io
+[PEP 740]: https://peps.python.org/pep-0740/
+[sdist format]: https://packaging.python.org/en/latest/specifications/source-distribution-format/
+[wheel format]: https://packaging.python.org/en/latest/specifications/binary-distribution-format/
+[PyPI Integrity]: https://docs.pypi.org/api/integrity/
+[GitHub immutable releases]: https://docs.github.com/en/code-security/supply-chain-security/understanding-your-software-supply-chain/immutable-releases
+[CEP 13]: ./cep-0013.md
 [CEP 14]: ./cep-0014.md
 [CEP 27]: ./cep-0027.md
-[PEP 740]: https://peps.python.org/pep-0740/
-[PEP 503]: https://peps.python.org/pep-0503/
-[PyPI Integrity]: https://docs.pypi.org/api/integrity/
-[PURL]: https://github.com/package-url/purl-spec
-[actions-attest]: https://github.com/actions/attest
-[TUF]: https://theupdateframework.io/
+[CEP 50]: ./cep-0050.md
